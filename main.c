@@ -7,5 +7,5 @@
 #include <time.h>
 int main(){
     printf("hello project");
-    printf("Checking");
+    printf("project2");
 }
