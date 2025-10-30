@@ -1,0 +1,244 @@
+
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+// timing helper function, returns ns
+static inline long long get_time_ns(void){
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (long long)ts.tv_sec*1000000000LL + ts.tv_nsec;
+}
+
+// convert ns to ms for printing (makes numbers easier)
+static inline double ns_to_ms(long long ns){ return (double)ns/1.0e6; }
+
+// max memory used by this process
+static long mem_self(void){
+    struct rusage u;
+    if(getrusage(RUSAGE_SELF,&u)!=0) return -1;
+    return u.ru_maxrss;
+}
+
+// max memory used by child processes (just in case)
+static long mem_children(void){
+    struct rusage u;
+    if(getrusage(RUSAGE_CHILDREN,&u)!=0) return -1;
+    return u.ru_maxrss;
+}
+
+// simple struct to hold a chunk of array
+typedef struct{
+    size_t start;
+    size_t len;
+} Chunk;
+
+// fills array with pseudo random numbers
+static void fill_rand(int *arr, size_t n, unsigned seed){
+    uint32_t x = seed ? seed : 2463534242u;
+    for(size_t i=0;i<n;i++){
+        x ^= x<<13;
+        x ^= x>>17;
+        x ^= x<<5;
+        arr[i]=(int)(x&0x7fffffff); // non-negative
+    }
+}
+
+// check if array is sorted (just for debug)
+static int sorted(int *arr, size_t n){
+    for(size_t i=1;i<n;i++) if(arr[i-1]>arr[i]) return 0;
+    return 1;
+}
+
+// comparison for qsort
+static int cmp_int(const void *a,const void *b){
+    int x=*(int*)a;
+    int y=*(int*)b;
+    return (x>y)-(x<y);
+}
+
+// helper to write all bytes
+static ssize_t write_all(int fd,const void *buf,size_t n){
+    const char *p=(const char*)buf;
+    size_t off=0;
+    while(off<n){
+        ssize_t w=write(fd,p+off,n-off);
+        if(w<0){ if(errno==EINTR) continue; return -1;}
+        off+= (size_t)w;
+    }
+    return (ssize_t)off;
+}
+
+// helper to read all bytes
+static ssize_t read_all(int fd,void *buf,size_t n){
+    char *p=(char*)buf;
+    size_t off=0;
+    while(off<n){
+        ssize_t r=read(fd,p+off,n-off);
+        if(r==0) break;
+        if(r<0){ if(errno==EINTR) continue; return -1;}
+        off+=(size_t)r;
+    }
+    return (ssize_t)off;
+}
+
+// for merging
+typedef struct{
+    int val;
+    size_t chunk;
+    size_t idx; // index in chunk
+} Node;
+
+typedef struct{
+    Node *arr;
+    size_t n;
+} MinHeap;
+
+static void swap(Node *a,Node *b){
+    Node t=*a;
+    *a=*b;
+    *b=t;
+}
+
+static void sift_down(MinHeap *h,size_t i){
+    for(;;){
+        size_t l=2*i+1;
+        size_t r=l+1;
+        size_t smallest=i;
+        if(l<h->n && h->arr[l].val<h->arr[smallest].val) smallest=l;
+        if(r<h->n && h->arr[r].val<h->arr[smallest].val) smallest=r;
+        if(smallest==i) break;
+        swap(&h->arr[i],&h->arr[smallest]);
+        i=smallest;
+    }
+}
+
+// merge sorted chunks
+static void merge_chunks(int *arr,int *out,Chunk *chunks,size_t k){
+    Node *nodes=malloc(sizeof(Node)*k);
+    MinHeap h={.arr=nodes,.n=0};
+
+    for(size_t i=0;i<k;i++){
+        if(chunks[i].len==0) continue;
+        Node n={.val=arr[chunks[i].start],.chunk=i,.idx=0};
+        h.arr[h.n++]=n;
+    }
+
+    // build heap
+    for(ssize_t i=(ssize_t)h.n/2-1;i>=0;i--) sift_down(&h,(size_t)i);
+
+    size_t out_idx=0;
+    while(h.n>0){
+        Node root=h.arr[0];
+        out[out_idx++]=root.val;
+
+        size_t c=root.chunk;
+        size_t idx=root.idx+1;
+
+        if(idx<chunks[c].len){
+            h.arr[0].val=arr[chunks[c].start+idx];
+            h.arr[0].idx=idx;
+        }else{
+            h.arr[0]=h.arr[h.n-1];
+            h.n--;
+        }
+
+        if(h.n>0) sift_down(&h,0);
+    }
+    free(nodes);
+}
+
+// main function
+int main(void){
+    size_t N=131072;
+    //size_t N=32;
+     // array size
+    unsigned seed=12345;
+
+    // use shared memory so children can see array
+    int *A=mmap(NULL,N*sizeof(int),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    int *B=mmap(NULL,N*sizeof(int),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+
+    fill_rand(A,N,seed);
+
+    printf("Multiprocessing sort demo, size=%zu\n",N);
+
+    size_t worker_list[4]={1,2,4,8};
+    for(int wi=0;wi<4;wi++){
+        size_t W=worker_list[wi];
+
+        // make chunks
+        Chunk *C=calloc(W,sizeof(Chunk));
+        size_t base=N/W;
+        size_t rem=N%W;
+        for(size_t i=0;i<W;i++){
+            size_t start=i*base + (i<rem?i:rem);
+            size_t len=base + (i<rem?1:0);
+            C[i]=(Chunk){.start=start,.len=len};
+        }
+
+        // pipe for IPC
+        int fd[2];
+        pipe(fd);
+
+        long long t0=get_time_ns();
+
+        // fork workers
+        for(size_t i=0;i<W;i++){
+            pid_t p=fork();
+            if(p==0){
+                close(fd[0]); // close read end
+                if(C[i].len>1) qsort(A+C[i].start,C[i].len,sizeof(int),cmp_int);
+                write_all(fd[1],&C[i],sizeof(Chunk));
+                _exit(0);
+            }
+        }
+
+        close(fd[1]); // parent closes write end
+
+        Chunk *got=calloc(W,sizeof(Chunk));
+        for(size_t i=0;i<W;i++){
+            read_all(fd[0],&got[i],sizeof(Chunk));
+        }
+        close(fd[0]);
+
+        // wait all children
+        size_t r=0; int status;
+        while(r<W){ pid_t w=wait(&status); if(w>0) r++; }
+
+        long long t1=get_time_ns();
+
+        merge_chunks(A,B,got,W);
+
+        long long t2=get_time_ns();
+
+        printf("Workers=%zu Map=%.3fms Reduce=%.3fms Total=%.3fms\n",
+               W,ns_to_ms(t1-t0),ns_to_ms(t2-t1),ns_to_ms(t2-t0));
+
+        free(C); free(got);
+    }
+
+    munmap(A,N*sizeof(int));
+    munmap(B,N*sizeof(int));
+
+    return 0;
+}
+
+
+
+
+
+
