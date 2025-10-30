@@ -1,0 +1,198 @@
+
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/resource.h>
+#include <limits.h>
+#include <stdatomic.h>
+#include <string.h> 
+
+// get current time in ns
+static inline long long t_ns(void){
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (long long)ts.tv_sec*1000000000LL + ts.tv_nsec;
+}
+
+// convert ns to ms
+static inline double ns_to_ms(long long ns){ return (double)ns/1.0e6; }
+
+// get max rss of process
+static long rss(void){
+    struct rusage r;
+    if(getrusage(RUSAGE_SELF,&r)!=0) return -1;
+    return r.ru_maxrss;
+}
+
+
+typedef enum { NAIVE=0, MUTEX=1, ATOMIC=2 } Mode;
+
+typedef struct{
+    size_t start;
+    size_t len;
+} Chunk;
+
+typedef struct{
+    int *arr;          // input array
+    size_t n;          // size of array
+    size_t nw;         // number of threads
+    unsigned seed;     // seed for RNG
+    int verify;        // verify result
+    Mode mode;         // which sync method
+    int gmax;          // shared max for naive/mutex
+    _Atomic int gmax_a; // atomic version
+    pthread_mutex_t mu; // mutex for MUTEX mode
+} Ctx;
+
+// fill array with random numbers
+static void fill_rand(int *a, size_t n, unsigned s){
+    uint32_t x = s?s:2463534242u;
+    for(size_t i=0;i<n;i++){
+        x^=x<<13; x^=x>>17; x^=x<<5;
+        a[i]=(int)(x&0x7fffffff);
+    }
+}
+
+// sequential max for checking
+static int seq_max(int *a, size_t n){
+    int m=a[0];
+    for(size_t i=1;i<n;i++) if(a[i]>m) m=a[i];
+    return m;
+}
+typedef struct{ Ctx *c; size_t idx; } WArg;
+
+static void *w_func(void *arg){
+    WArg *wa=(WArg*)arg;
+    Ctx *c=wa->c;
+    size_t i=wa->idx;
+
+    // compute my chunk
+    size_t b=c->n/c->nw;
+    size_t r=c->n%c->nw;
+    size_t s=i*b + (i<r?i:r);
+    size_t l=b + (i<r?1:0);
+
+    // local max
+    int lm = (l? c->arr[s] : INT32_MIN);
+    for(size_t k=1;k<l;k++) if(c->arr[s+k]>lm) lm=c->arr[s+k];
+
+    if(l==0) return NULL;
+
+    // update global max depending on mode
+    switch(c->mode){
+        case NAIVE:
+            if(lm>c->gmax) c->gmax=lm;
+            break;
+        case MUTEX:
+            pthread_mutex_lock(&c->mu);
+            if(lm>c->gmax) c->gmax=lm;
+            pthread_mutex_unlock(&c->mu);
+            break;
+        case ATOMIC:{
+            int prev=atomic_load_explicit(&c->gmax_a,memory_order_relaxed);
+            while(lm>prev){
+                if(atomic_compare_exchange_weak_explicit(&c->gmax_a,&prev,lm,
+                                                         memory_order_release,memory_order_relaxed)) break;
+            }
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+int main(int argc,char **argv){
+
+    Ctx c={0};
+    c.n=131072;
+    //c.n=32;
+    c.seed=12345;
+    c.verify=0;
+    c.mode=MUTEX;
+
+    char *ms=NULL;
+    int opt;
+    while((opt=getopt(argc,argv,"n:s:m:v"))!=-1){
+        switch(opt){
+            case 'n': c.n=(size_t)strtoull(optarg,NULL,10); break;
+            case 's': c.seed=(unsigned)strtoul(optarg,NULL,10); break;
+            case 'm': ms=optarg; break;
+            case 'v': c.verify=1; break;
+        }
+    }
+
+    if(ms){
+        if(strcmp(ms,"naive")==0) c.mode=NAIVE;
+        else if(strcmp(ms,"mutex")==0) c.mode=MUTEX;
+        else if(strcmp(ms,"atomic")==0) c.mode=ATOMIC;
+    }
+
+    // allocate array
+    c.arr=malloc(sizeof(int)*c.n);
+    if(!c.arr){ perror("malloc"); return 1; }
+    fill_rand(c.arr,c.n,c.seed);
+
+    size_t wl[]={1,2,4,8};
+    size_t nwc=sizeof(wl)/sizeof(wl[0]);
+
+    printf("Max value aggregation (%s mode), array size=%zu\n",
+           c.mode==NAIVE?"naive":c.mode==MUTEX?"mutex":"atomic",c.n);
+
+    for(size_t wi=0;wi<nwc;wi++){
+
+        c.nw=wl[wi];
+
+        // reset global max
+        if(c.mode==ATOMIC) atomic_store(&c.gmax_a,INT32_MIN);
+        else c.gmax=INT32_MIN;
+
+        pthread_mutex_init(&c.mu,NULL);
+
+        // allocate threads
+        pthread_t *t=malloc(sizeof(pthread_t)*c.nw);
+        WArg *a=malloc(sizeof(WArg)*c.nw);
+        if(!t||!a){ perror("malloc"); return 1; }
+
+        long long t0=t_ns();
+
+        // spawn threads
+        for(size_t i=0;i<c.nw;i++){
+            a[i].c=&c; a[i].idx=i;
+            pthread_create(&t[i],NULL,w_func,&a[i]);
+        }
+
+        // join threads
+        for(size_t i=0;i<c.nw;i++) pthread_join(t[i],NULL);
+        long long t1=t_ns();
+
+        // reduce: get global max
+        int g=(c.mode==ATOMIC)?atomic_load(&c.gmax_a):c.gmax;
+        long long t2=t_ns();
+        long r=rss();
+
+        // verify
+        if(c.verify){
+            int m=seq_max(c.arr,c.n);
+            if(m!=g){ fprintf(stderr,"ERROR global max %d expected %d\n",g,m); return 1; }
+        }
+
+        printf("Workers=%zu | GlobalMax=%d | Map=%.3f ms | Reduce=%.3f ms | Total=%.3f ms | MaxRSS=%ld KB\n",
+               c.nw,g,ns_to_ms(t1-t0),ns_to_ms(t2-t1),ns_to_ms(t2-t0),r);
+
+        pthread_mutex_destroy(&c.mu);
+        free(t); free(a);
+    }
+
+    free(c.arr);
+
+    return 0;
+}
+
+
+
+
