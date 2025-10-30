@@ -1,0 +1,256 @@
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/resource.h>
+
+// get current time in nanoseconds (used for performance measurement)
+long long now_ns() {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC,&t); // monotonic clock avoids jumps
+    return t.tv_sec*1000000000LL + t.tv_nsec; // convert seconds + nanoseconds to ns
+}
+
+// convert nanoseconds to milliseconds (for easier reading)
+double ns_to_ms(long long x) {
+    return (double)x/1.0e6;
+}
+
+// get maximum resident set size (memory usage) of this process
+long get_rss() {
+    struct rusage r;
+    if(getrusage(RUSAGE_SELF,&r)!=0) return -1; // fail check
+    return r.ru_maxrss; // returns KB on Linux
+}
+
+// chunk of array handled by a worker
+typedef struct { size_t s,l; } Chk;
+
+// simple thread-safe queue (ring buffer) to pass chunks from mappers to reducer
+typedef struct {
+    Chk *buf; // actual storage
+    size_t cap,head,tail,cnt; // capacity and indices
+    pthread_mutex_t mu; // mutex for synchronizing access
+    pthread_cond_t not_empty, not_full; // condition variables for blocking
+} Q;
+
+// initialize queue
+void q_init(Q*q,size_t c) {
+    q->buf = (Chk*)malloc(sizeof(Chk)*c); // allocate space for chunks
+    if(!q->buf) exit(1); // fail check
+    q->cap=c;
+    q->head=q->tail=q->cnt=0; // start empty
+    pthread_mutex_init(&q->mu,NULL); // initialize mutex
+    pthread_cond_init(&q->not_empty,NULL); // initialize cond var
+    pthread_cond_init(&q->not_full,NULL); // initialize cond var
+}
+
+// destroy queue
+void q_destroy(Q*q) {
+    free(q->buf); // free memory
+    pthread_mutex_destroy(&q->mu); // destroy mutex
+    pthread_cond_destroy(&q->not_empty); // destroy cond vars
+    pthread_cond_destroy(&q->not_full);
+}
+
+// push chunk to queue (blocks if full)
+void q_push(Q*q,Chk x) {
+    pthread_mutex_lock(&q->mu); // lock before accessing shared data
+    while(q->cnt==q->cap) pthread_cond_wait(&q->not_full,&q->mu); // wait if full
+    q->buf[q->tail] = x; // insert at tail
+    q->tail = (q->tail+1)%q->cap; // wrap around
+    q->cnt++;
+    pthread_cond_signal(&q->not_empty); // signal consumer
+    pthread_mutex_unlock(&q->mu); // unlock
+}
+
+// pop chunk from queue (blocks if empty)
+Chk q_pop(Q*q) {
+    pthread_mutex_lock(&q->mu); // lock mutex
+    while(q->cnt==0) pthread_cond_wait(&q->not_empty,&q->mu); // wait if empty
+    Chk x = q->buf[q->head]; // take element at head
+    q->head = (q->head+1)%q->cap; // advance head
+    q->cnt--; // decrease count
+    pthread_cond_signal(&q->not_full); // signal producer
+    pthread_mutex_unlock(&q->mu); // unlock
+    return x; // return chunk
+}
+
+// context shared across threads
+typedef struct {
+    int *a; // input array
+    int *b; // output array
+    size_t n; // number of elements
+    size_t nw; // number of worker threads
+    Q q; // queue to communicate chunks
+    volatile size_t done; // counter to track finished mappers
+} Ctx;
+
+// simple int comparator for qsort
+int cmp(const void*x,const void*y) {
+    int a=*(int*)x, b=*(int*)y;
+    return (a>b)-(a<b);
+}
+
+// worker argument struct
+typedef struct { Ctx*c; size_t i; } WArg;
+
+// mapper thread function
+void* mapper(void*arg) {
+    WArg* w = (WArg*)arg;
+    Ctx* c = w->c;
+    size_t idx = w->i;
+
+    // divide work among threads
+    size_t base = c->n/c->nw; // base size
+    size_t rem = c->n%c->nw;  // leftover elements
+    size_t s = idx*base + (idx<rem? idx:rem); // start index
+    size_t l = base + (idx<rem?1:0); // length of this chunk
+
+    if(l>1) qsort(c->a+s,l,sizeof(int),cmp); // sort my chunk
+
+    Chk tmp = {s,l};
+    q_push(&c->q,tmp); // push my chunk to queue for reducer
+
+    __sync_fetch_and_add(&c->done,1); // mark this mapper as done
+    return NULL;
+}
+
+// min-heap node
+typedef struct { int v; size_t r,i; } HNode;
+
+// min-heap structure
+typedef struct { HNode* arr; size_t n; } Heap;
+
+// swap two heap nodes
+void swap(HNode*x,HNode*y) {
+    HNode t = *x;
+    *x = *y;
+    *y = t;
+}
+
+// sift down to maintain heap property
+void sift_down(Heap* h, size_t i) {
+    for(;;) {
+        size_t l = 2*i+1;
+        size_t r = l+1;
+        size_t m = i;
+        if(l<h->n && h->arr[l].v < h->arr[m].v) m=l;
+        if(r<h->n && h->arr[r].v < h->arr[m].v) m=r;
+        if(m==i) break;
+        swap(&h->arr[m],&h->arr[i]);
+        i=m;
+    }
+}
+
+// merge k sorted chunks into output
+void merge(Ctx*c, Chk* ch, size_t k) {
+    HNode* arr = (HNode*)malloc(sizeof(HNode)*k); // heap array
+    Heap h = {arr,0};
+
+    for(size_t i=0;i<k;i++){
+        if(ch[i].l==0) continue; // skip empty
+        HNode n = {c->a[ch[i].s], i, 0}; // first element of chunk
+        h.arr[h.n++] = n;
+    }
+
+    // heapify
+    for(ssize_t i = h.n/2-1; i>=0; i--) sift_down(&h,(size_t)i);
+
+    size_t outi=0;
+    while(h.n>0){
+        HNode r=h.arr[0]; // get smallest
+        c->b[outi++] = r.v; // write to output
+        size_t ru=r.r;
+        size_t ix = r.i +1;
+        if(ix<ch[ru].l){
+            r.v = c->a[ch[ru].s+ix]; // next element in run
+            r.i = ix;
+            h.arr[0] = r;
+        } else {
+            h.arr[0] = h.arr[h.n-1]; // remove root
+            h.n--;
+        }
+        if(h.n>0) sift_down(&h,0); // restore heap
+    }
+    free(arr);
+}
+
+// reducer thread args
+typedef struct { Ctx* c; } RArg;
+
+// reducer thread function
+void* reducer(void*arg){
+    RArg* r = (RArg*)arg;
+    Ctx* c = r->c;
+    Chk* tmp = (Chk*)calloc(c->nw,sizeof(Chk)); // store chunks
+    for(size_t i=0;i<c->nw;i++) tmp[i] = q_pop(&c->q); // get chunks from queue
+    merge(c,tmp,c->nw); // merge sorted chunks
+    free(tmp);
+    return NULL;
+}
+
+// fill array with random numbers
+void fill_rand(int* a, size_t n, unsigned seed){
+    uint32_t x = seed?seed:2463534242u;
+    for(size_t i=0;i<n;i++){
+        x ^= x<<13;
+        x ^= x>>17;
+        x ^= x<<5;
+        a[i] = (int)(x&0x7fffffff);
+    }
+}
+
+// main function
+int main() {
+    size_t n = 131072;
+    //size_t n = 32;
+    size_t wks[]={1,2,4,8}; // worker counts
+    size_t nt = sizeof(wks)/sizeof(wks[0]);
+printf("Multithreading, array size: %zu\n", n);
+    for(size_t t=0;t<nt;t++){
+        size_t w = wks[t]; // number of workers
+        Ctx c={0};
+        c.n = n;
+        c.nw = w;
+        c.a = (int*)malloc(sizeof(int)*n);
+        c.b = (int*)malloc(sizeof(int)*n);
+
+        fill_rand(c.a,n,12345); // fill input array
+        q_init(&c.q,w); // init queue
+
+        pthread_t r;
+        RArg ra = {&c};
+        pthread_create(&r,NULL,reducer,&ra); // start reducer
+
+        pthread_t* th = (pthread_t*)malloc(sizeof(pthread_t)*w);
+        WArg* ar = (WArg*)malloc(sizeof(WArg)*w);
+
+        long long t0 = now_ns();
+        for(size_t i=0;i<w;i++){
+            ar[i].c = &c;
+            ar[i].i = i;
+            pthread_create(&th[i],NULL,mapper,&ar[i]); // spawn mapper
+        }
+
+        for(size_t i=0;i<w;i++) pthread_join(th[i],NULL); // wait for mappers
+        long long t1 = now_ns();
+
+        pthread_join(r,NULL); // wait for reducer
+        long long t2 = now_ns();
+
+        printf("Workers=%zu | Map=%.3f ms | Reduce=%.3f ms | Total=%.3f ms | MaxRSS=%ld KB\n",
+               w, ns_to_ms(t1-t0), ns_to_ms(t2-t1), ns_to_ms(t2-t0), get_rss());
+
+        q_destroy(&c.q);
+        free(c.a); free(c.b);
+        free(th); free(ar);
+    }
+    return 0;}
+
+
+
