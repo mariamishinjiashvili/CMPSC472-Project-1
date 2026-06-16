@@ -64,9 +64,3 @@ Experiments were performed on arrays of size 32 and 131,072 to evaluate the trad
 * Multiprocessing can outperform multithreading on larger workloads by reducing contention and utilizing multiple CPU cores.
 * Proper synchronization with mutexes and semaphores is essential to prevent race conditions and ensure correctness.
 
-## Author
-
-Mariami Shinjiashvili
-
-Penn State University
-B.S. Computer Science
